@@ -21,12 +21,40 @@ class URLRequest(BaseModel):
 class DownloadRequest(BaseModel):
     url: str
     quality: str  # "1080", "720", "480", "360", "audio"
-
-def get_video_info(url: str):
+def get_download_url(url: str, quality: str):
+    format_str = build_format_string(quality)
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "format": format_str,
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        formats = info.get("formats", [])
+
+        if quality == "audio":
+            for f in reversed(formats):
+                if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                    if f.get("url"):
+                        return f.get("url"), "mp3"
+            # fallback
+            for f in reversed(formats):
+                if f.get("acodec") != "none" and f.get("url"):
+                    return f.get("url"), "mp3"
+        else:
+            # Try to find best format matching quality
+            for f in reversed(formats):
+                h = f.get("height", 0)
+                if h and h <= int(quality) and f.get("url"):
+                    return f.get("url"), "mp4"
+            # fallback to any available
+            for f in reversed(formats):
+                if f.get("url"):
+                    return f.get("url"), "mp4"
+
+        return None, None
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
