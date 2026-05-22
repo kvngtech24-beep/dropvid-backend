@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 import yt_dlp
 import asyncio
 
@@ -78,17 +78,14 @@ def get_download_url(url: str, quality: str):
                 if f.get("acodec") != "none" and f.get("vcodec") == "none":
                     if f.get("url"):
                         return f.get("url"), "mp3"
-            # fallback
             for f in reversed(formats):
                 if f.get("acodec") != "none" and f.get("url"):
                     return f.get("url"), "mp3"
         else:
-            # Try to find best format matching quality
             for f in reversed(formats):
                 h = f.get("height", 0)
                 if h and h <= int(quality) and f.get("url"):
                     return f.get("url"), "mp4"
-            # fallback to any available
             for f in reversed(formats):
                 if f.get("url"):
                     return f.get("url"), "mp4"
