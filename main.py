@@ -24,7 +24,6 @@ class URLRequest(BaseModel):
 
 class DownloadRequest(BaseModel):
     url: str
-    quality: str
 
 def get_video_info(url: str):
     ydl_opts = {
@@ -35,60 +34,23 @@ def get_video_info(url: str):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-        formats = info.get("formats", [])
-
-        available_qualities = set()
-        for f in formats:
-            h = f.get("height")
-            if h:
-                if h >= 1080:
-                    available_qualities.add("1080")
-                elif h >= 720:
-                    available_qualities.add("720")
-                elif h >= 480:
-                    available_qualities.add("480")
-                elif h >= 360:
-                    available_qualities.add("360")
-        available_qualities.add("audio")
-
         return {
             "title": info.get("title", "Unknown Title"),
             "thumbnail": info.get("thumbnail", ""),
             "duration": info.get("duration", 0),
             "platform": info.get("extractor_key", "Unknown"),
-            "qualities": sorted(list(available_qualities - {"audio"}), reverse=True) + ["audio"],
         }
 
-def download_video_file(url: str, quality: str, output_path: str):
-    if quality == "audio":
-        format_str = "bestaudio/best"
-        postprocessors = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-        }]
-        ext = "mp3"
-    else:
-        format_str = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best[height<={quality}]"
-        postprocessors = [{
-            "key": "FFmpegVideoConvertor",
-            "preferedformat": "mp4",
-        }]
-        ext = "mp4"
-
+def download_video_file(url: str, output_path: str):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "format": format_str,
-        "outtmpl": output_path,
-        "postprocessors": postprocessors,
-        "merge_output_format": "mp4",
+        "format": "best",
+        "outtmpl": output_path + ".%(ext)s",
     }
-
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
-
-    return ext
 
 @app.get("/")
 def root():
@@ -118,18 +80,16 @@ async def download_video(request: DownloadRequest):
         filename = str(uuid.uuid4())
         output_path = os.path.join(tmp_dir, filename)
 
-        ext = await asyncio.to_thread(
-            download_video_file, request.url, request.quality, output_path
-        )
+        await asyncio.to_thread(download_video_file, request.url, output_path)
 
-        # Find the actual file (yt-dlp adds extension)
         for f in os.listdir(tmp_dir):
             if f.startswith(filename):
                 final_path = os.path.join(tmp_dir, f)
+                actual_ext = f.split(".")[-1]
                 return FileResponse(
                     path=final_path,
-                    filename=f"dropvid.{ext}",
-                    media_type="video/mp4" if ext == "mp4" else "audio/mpeg"
+                    filename=f"dropvid.{actual_ext}",
+                    media_type="video/mp4" if actual_ext != "mp3" else "audio/mpeg"
                 )
 
         raise HTTPException(status_code=404, detail="File not found after download")
