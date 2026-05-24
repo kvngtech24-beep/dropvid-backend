@@ -1,9 +1,13 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import yt_dlp
 import asyncio
+import os
+import uuid
+import tempfile
 
 app = FastAPI(title="DropVid API")
 
@@ -55,42 +59,36 @@ def get_video_info(url: str):
             "qualities": sorted(list(available_qualities - {"audio"}), reverse=True) + ["audio"],
         }
 
-def build_format_string(quality: str) -> str:
+def download_video_file(url: str, quality: str, output_path: str):
     if quality == "audio":
-        return "bestaudio/best"
-    return f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        format_str = "bestaudio/best"
+        postprocessors = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+        }]
+        ext = "mp3"
+    else:
+        format_str = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best[height<={quality}]"
+        postprocessors = [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }]
+        ext = "mp4"
 
-def get_download_url(url: str, quality: str):
-    format_str = build_format_string(quality)
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
-        "format": format_str,
         "noplaylist": True,
+        "format": format_str,
+        "outtmpl": output_path,
+        "postprocessors": postprocessors,
+        "merge_output_format": "mp4",
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        formats = info.get("formats", [])
+        ydl.download([url])
 
-        if quality == "audio":
-            for f in reversed(formats):
-                if f.get("acodec") != "none" and f.get("vcodec") == "none":
-                    if f.get("url"):
-                        return f.get("url"), "mp3"
-            for f in reversed(formats):
-                if f.get("acodec") != "none" and f.get("url"):
-                    return f.get("url"), "mp3"
-        else:
-            for f in reversed(formats):
-                h = f.get("height", 0)
-                if h and h <= int(quality) and f.get("url"):
-                    return f.get("url"), "mp4"
-            for f in reversed(formats):
-                if f.get("url"):
-                    return f.get("url"), "mp4"
-
-        return None, None
+    return ext
 
 @app.get("/")
 def root():
@@ -116,11 +114,25 @@ async def fetch_info(request: URLRequest):
 @app.post("/download")
 async def download_video(request: DownloadRequest):
     try:
-        download_url, ext = await asyncio.to_thread(
-            get_download_url, request.url, request.quality
+        tmp_dir = tempfile.mkdtemp()
+        filename = str(uuid.uuid4())
+        output_path = os.path.join(tmp_dir, filename)
+
+        ext = await asyncio.to_thread(
+            download_video_file, request.url, request.quality, output_path
         )
-        if not download_url:
-            raise HTTPException(status_code=404, detail="No download URL found")
-        return {"download_url": download_url, "ext": ext}
+
+        # Find the actual file (yt-dlp adds extension)
+        for f in os.listdir(tmp_dir):
+            if f.startswith(filename):
+                final_path = os.path.join(tmp_dir, f)
+                return FileResponse(
+                    path=final_path,
+                    filename=f"dropvid.{ext}",
+                    media_type="video/mp4" if ext == "mp4" else "audio/mpeg"
+                )
+
+        raise HTTPException(status_code=404, detail="File not found after download")
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
