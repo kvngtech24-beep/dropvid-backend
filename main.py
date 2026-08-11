@@ -1,60 +1,130 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
-import yt_dlp
-import asyncio
 import os
-import uuid
+import glob
+import shutil
 import tempfile
+import asyncio
+from typing import List
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import yt_dlp
+import imageio_ffmpeg
 
 app = FastAPI(title="DropVid API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Replace with your frontend URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+
 class URLRequest(BaseModel):
     urls: List[str]
 
+
 class DownloadRequest(BaseModel):
     url: str
+    quality: str = "720"  # "1080", "720", "480", "360", "audio" — defaults so old clients don't 422
+
 
 def get_video_info(url: str):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "noplaylist": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
+        formats = info.get("formats", [])
+
+        available_qualities = set()
+        for f in formats:
+            h = f.get("height")
+            if h:
+                if h >= 1080:
+                    available_qualities.add("1080")
+                elif h >= 720:
+                    available_qualities.add("720")
+                elif h >= 480:
+                    available_qualities.add("480")
+                elif h >= 360:
+                    available_qualities.add("360")
+        available_qualities.add("audio")
+
         return {
             "title": info.get("title", "Unknown Title"),
             "thumbnail": info.get("thumbnail", ""),
             "duration": info.get("duration", 0),
             "platform": info.get("extractor_key", "Unknown"),
+            "qualities": sorted(list(available_qualities - {"audio"}), reverse=True) + ["audio"],
         }
 
-def download_video_file(url: str, output_path: str):
+
+def build_format_string(quality: str) -> str:
+    if quality == "audio":
+        return "bestaudio/best"
+    return f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+
+
+def download_to_temp(url: str, quality: str):
+    """
+    Actually downloads (and, for video, merges) the file server-side using
+    yt-dlp + a bundled ffmpeg binary, so we can hand back a real playable
+    file instead of a bare CDN URL that the browser can't use directly.
+    Returns (filepath, tmpdir) — caller is responsible for cleaning tmpdir.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="dropvid_")
+    outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
-        "format": "best",
-        "outtmpl": output_path + ".%(ext)s",
+        "outtmpl": outtmpl,
+        "ffmpeg_location": FFMPEG_PATH,
+        "format": build_format_string(quality),
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+
+    if quality == "audio":
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    else:
+        ydl_opts["merge_output_format"] = "mp4"
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+    # Postprocessing can rename the file (e.g. .webm -> .mp3), so find
+    # whatever actually landed in the temp dir rather than guessing the name.
+    produced = glob.glob(os.path.join(tmpdir, "*"))
+    if not produced:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("Download finished but no output file was found")
+
+    return produced[0], tmpdir
+
+
+def cleanup_tmpdir(path: str):
+    shutil.rmtree(path, ignore_errors=True)
+
 
 @app.get("/")
 def root():
-    return {"status": "DropVid API is running 🚀"}
+    return {"status": "DropVid API is running \U0001f680"}
+
 
 @app.post("/info")
 async def fetch_info(request: URLRequest):
@@ -73,26 +143,24 @@ async def fetch_info(request: URLRequest):
 
     return {"results": results}
 
+
 @app.post("/download")
-async def download_video(request: DownloadRequest):
+async def download_video(request: DownloadRequest, background_tasks: BackgroundTasks):
     try:
-        tmp_dir = tempfile.mkdtemp()
-        filename = str(uuid.uuid4())
-        output_path = os.path.join(tmp_dir, filename)
-
-        await asyncio.to_thread(download_video_file, request.url, output_path)
-
-        for f in os.listdir(tmp_dir):
-            if f.startswith(filename):
-                final_path = os.path.join(tmp_dir, f)
-                actual_ext = f.split(".")[-1]
-                return FileResponse(
-                    path=final_path,
-                    filename=f"dropvid.{actual_ext}",
-                    media_type="video/mp4" if actual_ext != "mp3" else "audio/mpeg"
-                )
-
-        raise HTTPException(status_code=404, detail="File not found after download")
-
+        filepath, tmpdir = await asyncio.to_thread(
+            download_to_temp, request.url, request.quality
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    background_tasks.add_task(cleanup_tmpdir, tmpdir)
+
+    ext = os.path.splitext(filepath)[1].lstrip(".") or ("mp3" if request.quality == "audio" else "mp4")
+    media_type = "audio/mpeg" if ext == "mp3" else "video/mp4"
+
+    return FileResponse(
+        path=filepath,
+        media_type=media_type,
+        filename=f"dropvid.{ext}",
+        background=background_tasks,
+    )
