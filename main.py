@@ -20,6 +20,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
@@ -31,7 +32,7 @@ class URLRequest(BaseModel):
 
 class DownloadRequest(BaseModel):
     url: str
-    quality: str = "720"  # "1080", "720", "480", "360", "audio" — defaults so old clients don't 422
+    quality: str = "worst"  # "1080", "720", "480", "360", "240", "worst" (Data Saver), "audio"
 
 
 def get_video_info(url: str):
@@ -43,33 +44,68 @@ def get_video_info(url: str):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         formats = info.get("formats", [])
+        duration = info.get("duration", 0) or 0
 
-        available_qualities = set()
-        for f in formats:
-            h = f.get("height")
-            if h:
-                if h >= 1080:
-                    available_qualities.add("1080")
-                elif h >= 720:
-                    available_qualities.add("720")
-                elif h >= 480:
-                    available_qualities.add("480")
-                elif h >= 360:
-                    available_qualities.add("360")
-        available_qualities.add("audio")
+        def fmt_size(f):
+            return f.get("filesize") or f.get("filesize_approx") or 0
+
+        audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
+        audio_size = max((fmt_size(f) for f in audio_formats), default=0)
+        if not audio_size and duration:
+            audio_size = int(duration * 128 * 1000 / 8)
+
+        BUCKETS = [1080, 720, 480, 360, 240]
+        bucket_sizes = {}
+        for b in BUCKETS:
+            candidates = [f for f in formats if f.get("height") and b - 40 <= f.get("height") <= b + 40]
+            if not candidates:
+                continue
+            best = max(candidates, key=fmt_size)
+            size = fmt_size(best)
+            if size and best.get("vcodec") != "none" and best.get("acodec") == "none":
+                size += audio_size
+            bucket_sizes[b] = size
+
+        # "Data Saver" = the smallest real stream available, mirroring what
+        # sites like fdown serve by default (the platform's own low-bitrate
+        # SD encode), rather than the best stream within a height cap.
+        muxed = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none") and fmt_size(f) > 0]
+        if muxed:
+            smallest = min(muxed, key=fmt_size)
+            data_saver_size = fmt_size(smallest)
+        else:
+            video_only = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none") and fmt_size(f) > 0]
+            if video_only:
+                smallest = min(video_only, key=fmt_size)
+                data_saver_size = fmt_size(smallest) + audio_size
+            else:
+                data_saver_size = 0
+
+        qualities = []
+        data_saver_mb = round(data_saver_size / 1_000_000, 1) if data_saver_size else None
+        qualities.append({"value": "worst", "label": "Data Saver", "size_mb": data_saver_mb})
+
+        for b in sorted(bucket_sizes.keys(), reverse=True):
+            size_mb = round(bucket_sizes[b] / 1_000_000, 1) if bucket_sizes[b] else None
+            qualities.append({"value": str(b), "label": f"{b}p", "size_mb": size_mb})
+
+        audio_size_mb = round(audio_size / 1_000_000, 1) if audio_size else None
+        qualities.append({"value": "audio", "label": "Audio (MP3)", "size_mb": audio_size_mb})
 
         return {
             "title": info.get("title", "Unknown Title"),
             "thumbnail": info.get("thumbnail", ""),
-            "duration": info.get("duration", 0),
+            "duration": duration,
             "platform": info.get("extractor_key", "Unknown"),
-            "qualities": sorted(list(available_qualities - {"audio"}), reverse=True) + ["audio"],
+            "qualities": qualities,
         }
 
 
 def build_format_string(quality: str) -> str:
     if quality == "audio":
         return "bestaudio/best"
+    if quality == "worst":
+        return "worst"
     return f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
 
 
