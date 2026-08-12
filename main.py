@@ -25,11 +25,35 @@ app.add_middleware(
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-# Render mounts "Secret Files" at /etc/secrets/<filename>. As a more
-# reliable alternative (some browsers have trouble pasting into that box),
-# we also accept the raw cookies.txt contents pasted into a normal
-# Environment Variable called YOUTUBE_COOKIES_CONTENT, and write it to a
-# temp file ourselves at startup.
+
+def normalize_netscape_cookies(raw: str) -> str:
+    """
+    Rebuilds a Netscape-format cookies file field-by-field so it survives
+    being pasted through a browser textarea, which often collapses tabs
+    into spaces. Each real cookie line has exactly 7 whitespace-separated
+    fields; comments/blank lines are passed through untouched.
+    """
+    lines_out = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            lines_out.append(line if stripped else "")
+            continue
+        fields = stripped.split()
+        if len(fields) >= 7:
+            # Cookie values can't legally contain whitespace, so this is safe.
+            fields = fields[:6] + [" ".join(fields[6:])]
+            lines_out.append("\t".join(fields))
+        else:
+            lines_out.append(line)  # leave anything unexpected as-is
+    return "\n".join(lines_out) + "\n"
+
+
+# Render mounts "Secret Files" at /etc/secrets/<filename>. As a fallback
+# (some browsers mangle tabs when pasting into that box), we also accept
+# the raw cookies.txt contents pasted into a plain Environment Variable
+# called YOUTUBE_COOKIES_CONTENT. Either way, we rewrite the content into
+# a fresh, correctly-formatted temp file before handing it to yt-dlp.
 COOKIES_FILE = None
 
 _secret_candidates = [
@@ -37,15 +61,21 @@ _secret_candidates = [
     "/etc/secrets/cookies.txt",
     os.path.join(os.path.dirname(__file__), "cookies.txt"),
 ]
-COOKIES_FILE = next((p for p in _secret_candidates if p and os.path.isfile(p)), None)
+_secret_path = next((p for p in _secret_candidates if p and os.path.isfile(p)), None)
 
-if not COOKIES_FILE:
-    _cookies_content = os.environ.get("YOUTUBE_COOKIES_CONTENT", "").strip()
-    if _cookies_content:
-        _tmp_cookie_path = os.path.join(tempfile.gettempdir(), "dropvid_cookies.txt")
-        with open(_tmp_cookie_path, "w") as f:
-            f.write(_cookies_content + "\n")
-        COOKIES_FILE = _tmp_cookie_path
+_raw_cookies = None
+if _secret_path:
+    with open(_secret_path, "r") as f:
+        _raw_cookies = f.read()
+elif os.environ.get("YOUTUBE_COOKIES_CONTENT", "").strip():
+    _raw_cookies = os.environ["YOUTUBE_COOKIES_CONTENT"]
+
+if _raw_cookies:
+    _normalized = normalize_netscape_cookies(_raw_cookies)
+    _tmp_cookie_path = os.path.join(tempfile.gettempdir(), "dropvid_cookies.txt")
+    with open(_tmp_cookie_path, "w") as f:
+        f.write(_normalized)
+    COOKIES_FILE = _tmp_cookie_path
 
 
 def base_ydl_opts() -> dict:
