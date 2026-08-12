@@ -25,6 +25,22 @@ app.add_middleware(
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
+# Render mounts "Secret Files" at /etc/secrets/<filename>. We also check a
+# local path and an env var override so this works the same way locally.
+COOKIES_CANDIDATES = [
+    os.environ.get("COOKIES_FILE", ""),
+    "/etc/secrets/cookies.txt",
+    os.path.join(os.path.dirname(__file__), "cookies.txt"),
+]
+COOKIES_FILE = next((p for p in COOKIES_CANDIDATES if p and os.path.isfile(p)), None)
+
+
+def base_ydl_opts() -> dict:
+    opts = {"quiet": True, "no_warnings": True}
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
 
 class URLRequest(BaseModel):
     urls: List[str]
@@ -37,8 +53,7 @@ class DownloadRequest(BaseModel):
 
 def get_video_info(url: str):
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        **base_ydl_opts(),
         "skip_download": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -120,8 +135,7 @@ def download_to_temp(url: str, quality: str):
     outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        **base_ydl_opts(),
         "outtmpl": outtmpl,
         "ffmpeg_location": FFMPEG_PATH,
         "format": build_format_string(quality),
@@ -159,7 +173,10 @@ def cleanup_tmpdir(path: str):
 
 @app.get("/")
 def root():
-    return {"status": "DropVid API is running \U0001f680"}
+    return {
+        "status": "DropVid API is running \U0001f680",
+        "cookies_loaded": bool(COOKIES_FILE),
+    }
 
 
 @app.post("/info")
