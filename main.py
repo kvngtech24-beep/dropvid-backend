@@ -25,14 +25,27 @@ app.add_middleware(
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-# Render mounts "Secret Files" at /etc/secrets/<filename>. We also check a
-# local path and an env var override so this works the same way locally.
-COOKIES_CANDIDATES = [
+# Render mounts "Secret Files" at /etc/secrets/<filename>. As a more
+# reliable alternative (some browsers have trouble pasting into that box),
+# we also accept the raw cookies.txt contents pasted into a normal
+# Environment Variable called YOUTUBE_COOKIES_CONTENT, and write it to a
+# temp file ourselves at startup.
+COOKIES_FILE = None
+
+_secret_candidates = [
     os.environ.get("COOKIES_FILE", ""),
     "/etc/secrets/cookies.txt",
     os.path.join(os.path.dirname(__file__), "cookies.txt"),
 ]
-COOKIES_FILE = next((p for p in COOKIES_CANDIDATES if p and os.path.isfile(p)), None)
+COOKIES_FILE = next((p for p in _secret_candidates if p and os.path.isfile(p)), None)
+
+if not COOKIES_FILE:
+    _cookies_content = os.environ.get("YOUTUBE_COOKIES_CONTENT", "").strip()
+    if _cookies_content:
+        _tmp_cookie_path = os.path.join(tempfile.gettempdir(), "dropvid_cookies.txt")
+        with open(_tmp_cookie_path, "w") as f:
+            f.write(_cookies_content + "\n")
+        COOKIES_FILE = _tmp_cookie_path
 
 
 def base_ydl_opts() -> dict:
